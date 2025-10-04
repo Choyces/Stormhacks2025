@@ -1,0 +1,665 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
+    <title>AI Lightshow Sync MVP</title>
+    <!-- Load Tailwind CSS -->
+    <script src="https://cdn.tailwindcss.com"></script>
+    <!-- QR Code Library CDN -->
+    <script src="https://cdn.jsdelivr.net/npm/qrcode.js@0.0.2/qrcode.min.js"></script>
+    <style>
+        @import url('https://fonts.googleapis.com/css2?family=Inter:wght@100..900&display=swap');
+        body {
+            font-family: 'Inter', sans-serif;
+            background-color: #0f172a; /* Dark background */
+            color: #e2e8f0;
+            transition: background-color 0.05s ease-in-out; 
+            min-height: 100vh;
+        }
+        .container-card {
+            background-color: #1e293b;
+            box-shadow: 0 15px 30px rgba(0, 0, 0, 0.4);
+            border: 1px solid #334155;
+        }
+        /* Full-screen flash effect for Audience View */
+        #audienceView {
+            position: fixed;
+            top: 0;
+            left: 0;
+            width: 100%;
+            height: 100%;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            flex-direction: column;
+            text-align: center;
+            transition: background-color 0.05s ease-in-out;
+        }
+        .loading-ring {
+            border: 4px solid rgba(255, 255, 255, 0.3);
+            border-top: 4px solid #8b5cf6;
+            border-radius: 50%;
+            width: 40px;
+            height: 40px;
+            animation: spin 1s linear infinite;
+        }
+        @keyframes spin {
+            0% { transform: rotate(0deg); }
+            100% { transform: rotate(360deg); }
+        }
+    </style>
+</head>
+<body class="flex items-center justify-center">
+
+    <div id="app" class="w-full max-w-xl p-4 md:p-8">
+
+        <header class="text-center mb-8">
+            <h1 class="text-4xl md:text-5xl font-extrabold text-indigo-400 tracking-tight">
+                AI Crowd Lightshow Sync
+            </h1>
+            <p class="mt-2 text-xl text-gray-400">
+                Performer Dashboard & Audience Sync
+            </p>
+        </header>
+
+        <!-- Dynamic Content Area -->
+        <div id="dynamicContent">
+            <!-- Content will be injected here based on app state (Setup, Performer, Audience) -->
+        </div>
+        
+        <!-- Auth/User Status -->
+        <div id="authStatus" class="mt-8 text-center text-sm text-gray-500"></div>
+
+        <!-- Custom Modal for Errors/Messages -->
+        <div id="messageModal" class="hidden fixed inset-0 bg-gray-900 bg-opacity-80 z-50 flex items-center justify-center p-4">
+            <div class="bg-gray-800 rounded-xl shadow-2xl p-6 w-full max-w-md border border-red-500">
+                <h3 class="text-xl font-bold text-red-400 mb-3">System Message</h3>
+                <p id="modalMessage" class="text-gray-300"></p>
+                <div class="mt-4 text-right">
+                    <button id="closeModalBtn" class="bg-red-600 hover:bg-red-700 text-white font-semibold py-2 px-4 rounded-lg">Dismiss</button>
+                </div>
+            </div>
+        </div>
+    </div>
+
+    <!-- Audience View (Output) - Full Screen Overlay -->
+    <div id="audienceView" class="hidden">
+        <div class="container-card p-6 rounded-xl" id="audienceMessageCard">
+            <h2 class="text-4xl font-extrabold text-white">SYNCHRONIZED</h2>
+            <p class="text-xl mt-2 text-gray-300">Awaiting the beat...</p>
+            <p class="text-sm mt-4 text-gray-500">Tap to exit sync mode.</p>
+        </div>
+    </div>
+
+
+    <!-- Firebase & Core Logic -->
+    <script type="module">
+        import { initializeApp } from "https://www.gstatic.com/firebasejs/10.6.0/firebase-app.js";
+        import { getAuth, signInAnonymously, signInWithCustomToken, onAuthStateChanged } from "https://www.gstatic.com/firebasejs/10.6.0/firebase-auth.js";
+        import { getFirestore, doc, setDoc, onSnapshot, collection, addDoc, updateDoc, deleteDoc, getDocs, query, where } from "https://www.gstatic.com/firebasejs/10.6.0/firebase-firestore.js";
+        import { setLogLevel } from "https://www.gstatic.com/firebasejs/10.6.0/firebase-firestore.js";
+
+        // --- Environment & Global State ---
+        const API_KEY = ""; // Placeholder for Canvas environment
+        const GEMINI_MODEL = 'gemini-2.5-flash-preview-05-20';
+        const API_URL = `https://generativelanguage.googleapis.com/v1beta/models/${GEMINI_MODEL}:generateContent?key=${API_KEY}`;
+        const MAX_RETRIES = 5;
+
+        const appId = typeof __app_id !== 'undefined' ? __app_id : 'default-app-id';
+        const firebaseConfig = typeof __firebase_config !== 'undefined' ? JSON.parse(__firebase_config) : {};
+        const authToken = typeof __initial_auth_token !== 'undefined' ? __initial_auth_token : null;
+        
+        let db, auth;
+        let userId = null;
+        let showId = null; // Unique ID for the current performer's show
+        let beatInterval = null;
+        
+        // Firestore Paths (All public data shared among the show)
+        const SHOWS_COLLECTION = `artifacts/${appId}/public/data/shows`;
+        const getSyncDocPath = (id) => `artifacts/${appId}/public/data/sync/show_${id}`;
+        
+        // --- UI Elements ---
+        const $app = document.getElementById('app');
+        const $body = document.body;
+        const $dynamicContent = document.getElementById('dynamicContent');
+        const $audienceView = document.getElementById('audienceView');
+        const $audienceMessageCard = document.getElementById('audienceMessageCard');
+        const $authStatus = document.getElementById('authStatus');
+        const $messageModal = document.getElementById('messageModal');
+        const $modalMessage = document.getElementById('modalMessage');
+        const $closeModalBtn = document.getElementById('closeModalBtn');
+
+        // --- Utility Functions ---
+
+        function showMessage(title, message) {
+            $messageModal.querySelector('h3').textContent = title;
+            $modalMessage.textContent = message;
+            $messageModal.classList.remove('hidden');
+        }
+        $closeModalBtn.addEventListener('click', () => {
+            $messageModal.classList.add('hidden');
+        });
+
+        // Function to handle fetching with exponential backoff
+        const fetchWithRetry = async (url, options) => {
+            for (let i = 0; i < MAX_RETRIES; i++) {
+                try {
+                    const response = await fetch(url, options);
+                    if (!response.ok) {
+                        if (response.status === 429 && i < MAX_RETRIES - 1) {
+                            const delay = Math.pow(2, i) * 1000 + Math.random() * 1000;
+                            await new Promise(resolve => setTimeout(resolve, delay));
+                            continue;
+                        }
+                        throw new Error(`HTTP error! status: ${response.status}`);
+                    }
+                    return response;
+                } catch (error) {
+                    console.error(`Attempt ${i + 1} failed:`, error);
+                    if (i === MAX_RETRIES - 1) throw error;
+                    const delay = Math.pow(2, i) * 1000 + Math.random() * 1000;
+                    await new Promise(resolve => setTimeout(resolve, delay));
+                }
+            }
+        };
+
+        // --- Firebase Initialization and Auth ---
+
+        async function initFirebase() {
+            try {
+                setLogLevel('Debug');
+                const firebaseApp = initializeApp(firebaseConfig);
+                db = getFirestore(firebaseApp);
+                auth = getAuth(firebaseApp);
+                
+                onAuthStateChanged(auth, async (user) => {
+                    if (user) {
+                        userId = user.uid;
+                        $authStatus.textContent = `User ID: ${userId} | App ID: ${appId}`;
+                    } else {
+                        if (authToken) {
+                            await signInWithCustomToken(auth, authToken);
+                        } else {
+                            await signInAnonymously(auth);
+                        }
+                        userId = auth.currentUser?.uid || crypto.randomUUID();
+                    }
+                    // Check for show ID in URL parameters (Audience flow)
+                    const urlParams = new URLSearchParams(window.location.search);
+                    const paramShowId = urlParams.get('show');
+
+                    if (paramShowId) {
+                        showId = paramShowId;
+                        renderAudienceJoin();
+                    } else {
+                        // Default to Performer Setup flow
+                        renderSetup();
+                    }
+                });
+            } catch (error) {
+                showMessage("Firebase Error", "Failed to initialize Firebase or authenticate.");
+                console.error("Firebase Initialization Error:", error);
+            }
+        }
+        
+        // --- Core Application State & Rendering ---
+
+        function clearContent() {
+            $dynamicContent.innerHTML = '';
+            $audienceView.classList.add('hidden');
+            $app.classList.remove('hidden'); 
+            $body.style.backgroundColor = '#0f172a';
+            stopConductor();
+            stopAudienceListener();
+        }
+
+        // --- VIEW 1: SETUP (Performer Login/Show ID Generation) ---
+
+        function renderSetup() {
+            clearContent();
+            $dynamicContent.innerHTML = `
+                <div class="container-card p-6 rounded-xl">
+                    <h2 class="text-2xl font-bold mb-4 text-indigo-400">Show Setup (Performer)</h2>
+                    <p class="text-gray-400 mb-4">Click "Start New Show" to generate a unique ID and enter the Performer Dashboard.</p>
+
+                    <button id="startNewShowBtn" class="w-full text-white font-bold py-3 px-6 rounded-lg transition duration-200 bg-indigo-600 hover:bg-indigo-700 focus:outline-none focus:ring-4 focus:ring-indigo-500 focus:ring-opacity-50">
+                        🎤 Start New Show
+                    </button>
+                    
+                    <div class="mt-6 border-t border-gray-600 pt-4">
+                        <h3 class="text-xl font-bold text-gray-300 mb-3">Join Show (Audience/Test)</h3>
+                        <input type="text" id="joinShowInput" placeholder="Enter Show ID (e.g., 1234)" class="w-full p-3 border border-gray-600 bg-gray-700 text-white rounded-lg focus:ring-blue-500 focus:border-blue-500 mb-3">
+                        <button id="joinShowBtn" class="w-full text-white font-bold py-3 px-6 rounded-lg transition duration-200 bg-blue-600 hover:bg-blue-700 focus:outline-none focus:ring-4 focus:ring-blue-500 focus:ring-opacity-50">
+                            💡 Join Audience View
+                        </button>
+                    </div>
+                </div>
+            `;
+            document.getElementById('startNewShowBtn').addEventListener('click', createNewShow);
+            document.getElementById('joinShowBtn').addEventListener('click', handleAudienceJoin);
+        }
+        
+        async function createNewShow() {
+            if (!userId) {
+                showMessage("Authentication Needed", "Please wait for user authentication to complete before creating a show.");
+                return;
+            }
+            // Simple 4-digit ID for QR readability
+            const newShowId = Math.floor(1000 + Math.random() * 9000).toString();
+            showId = newShowId;
+            
+            try {
+                // Create a basic show document linked to the performer
+                await setDoc(doc(db, SHOWS_COLLECTION, showId), {
+                    performerId: userId,
+                    showName: `Show ${newShowId}`,
+                    createdAt: Date.now(),
+                    songList: []
+                });
+                renderPerformerDashboard();
+            } catch (error) {
+                console.error("Error creating show:", error);
+                showMessage("Database Error", "Failed to create new show document.");
+            }
+        }
+
+        function handleAudienceJoin() {
+            const inputId = document.getElementById('joinShowInput').value.trim();
+            if (inputId) {
+                showId = inputId;
+                renderAudienceJoin();
+            } else {
+                showMessage("Input Required", "Please enter a valid Show ID.");
+            }
+        }
+
+        // --- VIEW 2: PERFORMER DASHBOARD ---
+
+        let currentSongList = [];
+        let selectedSongIndex = -1;
+
+        async function loadSongList() {
+             if (!db || !showId) return;
+             try {
+                const showDoc = await getDocs(query(collection(db, SHOWS_COLLECTION), where('__name__', '==', showId)));
+                if (!showDoc.empty) {
+                    currentSongList = showDoc.docs[0].data().songList || [];
+                } else {
+                    currentSongList = [];
+                }
+                renderPerformerDashboard(); // Re-render with new list
+             } catch(error) {
+                 console.error("Error loading song list:", error);
+                 showMessage("Load Error", "Failed to load song list from database.");
+                 currentSongList = [];
+                 renderPerformerDashboard();
+             }
+        }
+
+        function renderPerformerDashboard() {
+            clearContent();
+
+            const baseUrl = window.location.origin + window.location.pathname;
+            const joinUrl = `${baseUrl}?show=${showId}`;
+
+            $dynamicContent.innerHTML = `
+                <div class="container-card p-6 rounded-xl mb-6">
+                    <div class="flex justify-between items-center mb-4">
+                        <h2 class="text-2xl font-bold text-indigo-400">Dashboard: Show ${showId}</h2>
+                        <button id="backToSetupBtn" class="text-sm text-gray-400 hover:text-white transition duration-150">Exit</button>
+                    </div>
+                    
+                    <div id="qrCodeContainer" class="p-4 bg-white rounded-lg w-fit mx-auto shadow-inner mb-4"></div>
+                    <p class="text-center text-sm text-gray-400 mb-6 break-all">Audience Link: <a href="${joinUrl}" target="_blank" class="text-blue-400 hover:text-blue-300">${joinUrl}</a></p>
+
+                    <!-- Song List Management -->
+                    <h3 class="text-xl font-bold text-gray-300 mb-3 border-t border-gray-700 pt-4">Song List</h3>
+                    <div id="songList" class="space-y-3 mb-6">
+                        <!-- Songs will be injected here -->
+                    </div>
+                    
+                    <div class="flex space-x-2">
+                        <input type="text" id="songTitleInput" placeholder="Song Title" class="flex-1 p-2 border border-gray-600 bg-gray-700 text-white rounded-lg text-sm">
+                        <input type="text" id="artistInput" placeholder="Artist" class="flex-1 p-2 border border-gray-600 bg-gray-700 text-white rounded-lg text-sm">
+                        <button id="addSongBtn" class="bg-blue-600 hover:bg-blue-700 text-white p-2 rounded-lg text-sm font-semibold">Add</button>
+                    </div>
+                </div>
+
+                <!-- Sync Control Panel -->
+                <div id="syncControlPanel" class="container-card p-6 rounded-xl">
+                    <h3 class="text-xl font-bold text-emerald-400 mb-3">Live Sync Control</h3>
+                    <div id="currentSongInfo" class="text-center p-3 bg-gray-700 rounded-lg mb-4 text-gray-300 min-h-[50px]">
+                        Select a song from the list to start sync.
+                    </div>
+                    
+                    <div class="grid grid-cols-2 gap-4">
+                        <button id="startSyncBtn" class="w-full text-white font-bold py-3 px-4 rounded-lg bg-emerald-600 hover:bg-emerald-700 focus:ring-emerald-500 disabled:opacity-50" disabled>
+                            ▶️ Start Beat
+                        </button>
+                        <button id="stopSyncBtn" class="w-full text-white font-bold py-3 px-4 rounded-lg bg-red-600 hover:bg-red-700 focus:ring-red-500 hidden">
+                            ⏹ Stop Beat
+                        </button>
+                    </div>
+                    <p id="syncStatus" class="mt-4 text-center text-lg font-semibold text-gray-300">Status: Stopped</p>
+                </div>
+            `;
+            
+            // Render QR Code
+            new QRCode(document.getElementById("qrCodeContainer"), {
+                text: joinUrl,
+                width: 128,
+                height: 128,
+                colorDark: "#000000",
+                colorLight: "#ffffff",
+                correctLevel: QRCode.CorrectLevel.H
+            });
+            
+            document.getElementById('backToSetupBtn').addEventListener('click', renderSetup);
+            document.getElementById('addSongBtn').addEventListener('click', addSong);
+            document.getElementById('startSyncBtn').addEventListener('click', startSongSync);
+            document.getElementById('stopSyncBtn').addEventListener('click', stopConductor);
+
+            // Populate song list
+            renderSongListItems();
+        }
+
+        function renderSongListItems() {
+            const $list = document.getElementById('songList');
+            if (!$list) return;
+            $list.innerHTML = '';
+            
+            currentSongList.forEach((song, index) => {
+                const isSelected = index === selectedSongIndex;
+                const bpmText = song.bpm ? `<span class="font-bold">${song.bpm} BPM</span>` : 'Needs analysis';
+                const styleText = song.visualStyle || '...';
+                
+                const item = document.createElement('div');
+                item.className = `p-3 rounded-lg flex items-center justify-between transition duration-150 ${isSelected ? 'bg-indigo-700 border-2 border-indigo-400' : 'bg-gray-700 hover:bg-gray-600'}`;
+                item.innerHTML = `
+                    <div class="flex-1 cursor-pointer" data-index="${index}">
+                        <p class="font-semibold text-white truncate">${song.title} - ${song.artist}</p>
+                        <div class="text-sm text-gray-300 flex space-x-2">
+                            <span>${bpmText}</span>
+                            <span class="text-gray-400">|</span>
+                            <span class="truncate" style="color:${song.flashColor || '#e2e8f0'}">${styleText}</span>
+                        </div>
+                    </div>
+                    <div class="space-x-2 flex items-center">
+                        ${!song.bpm ? `<button class="analyzeBtn bg-purple-600 hover:bg-purple-700 text-white px-3 py-1 rounded-lg text-xs font-semibold" data-index="${index}">✨ AI Analyze</button>` : ''}
+                        <button class="deleteBtn bg-red-600 hover:bg-red-700 text-white px-3 py-1 rounded-lg text-xs font-semibold" data-index="${index}">X</button>
+                    </div>
+                `;
+                $list.appendChild(item);
+            });
+
+            // Attach event listeners to dynamically created buttons
+            $list.querySelectorAll('.analyzeBtn').forEach(btn => {
+                btn.addEventListener('click', (e) => analyzeSong(parseInt(e.currentTarget.dataset.index)));
+            });
+            $list.querySelectorAll('.deleteBtn').forEach(btn => {
+                btn.addEventListener('click', (e) => deleteSong(parseInt(e.currentTarget.dataset.index)));
+            });
+            $list.querySelectorAll('[data-index]').forEach(div => {
+                div.addEventListener('click', (e) => selectSong(parseInt(e.currentTarget.dataset.index)));
+            });
+            
+            // Update sync controls based on selection
+            if (selectedSongIndex > -1 && currentSongList[selectedSongIndex]?.bpm) {
+                document.getElementById('startSyncBtn').disabled = false;
+                const song = currentSongList[selectedSongIndex];
+                document.getElementById('currentSongInfo').innerHTML = `
+                    <p class="font-bold">${song.title}</p>
+                    <p>BPM: ${song.bpm} | Color: <span style="color:${song.flashColor}">${song.flashColor}</span></p>
+                `;
+            } else {
+                 document.getElementById('startSyncBtn').disabled = true;
+            }
+        }
+        
+        async function addSong() {
+            const title = document.getElementById('songTitleInput').value.trim();
+            const artist = document.getElementById('artistInput').value.trim();
+            
+            if (!title || !artist) {
+                showMessage("Input Required", "Please enter both a Song Title and an Artist.");
+                return;
+            }
+
+            currentSongList.push({ title, artist, bpm: null, flashColor: null, visualStyle: null });
+            await updateFirestoreSongList();
+
+            document.getElementById('songTitleInput').value = '';
+            document.getElementById('artistInput').value = '';
+        }
+        
+        function deleteSong(index) {
+            currentSongList.splice(index, 1);
+            if (selectedSongIndex === index) selectedSongIndex = -1;
+            updateFirestoreSongList();
+        }
+
+        function selectSong(index) {
+            selectedSongIndex = index;
+            renderSongListItems(); // Re-render to highlight selection
+        }
+
+        async function updateFirestoreSongList() {
+            if (!db || !showId) return;
+            try {
+                await updateDoc(doc(db, SHOWS_COLLECTION, showId), {
+                    songList: currentSongList
+                });
+                renderSongListItems();
+            } catch(error) {
+                console.error("Error updating song list:", error);
+                showMessage("Database Error", "Failed to save song list changes.");
+            }
+        }
+
+        // --- AI SONG ANALYSIS (Gemini API) ---
+
+        async function analyzeSong(index) {
+            const song = currentSongList[index];
+            const $analyzeBtn = document.querySelector(`.analyzeBtn[data-index="${index}"]`);
+            
+            if (!$analyzeBtn) return;
+            $analyzeBtn.disabled = true;
+            $analyzeBtn.innerHTML = '<div class="loading-ring h-4 w-4 mx-auto"></div>';
+
+            const userQuery = `Analyze the song: ${song.title} by ${song.artist}.`;
+            const systemPrompt = "You are a live music visual designer. Based on the provided song title and artist, find the song's BPM and suggest a primary flash color (HEX code) and a short descriptive visual style (e.g., 'fast, bright flashes'). Your response MUST be valid JSON conforming to the provided schema.";
+            
+            const payload = {
+                contents: [{ parts: [{ text: userQuery }] }],
+                tools: [{ "google_search": {} }],
+                systemInstruction: { parts: [{ text: systemPrompt }] },
+                generationConfig: {
+                    responseMimeType: "application/json",
+                    responseSchema: {
+                        type: "OBJECT",
+                        properties: {
+                            "bpm": { "type": "INTEGER" },
+                            "flashColor": { "type": "STRING", "description": "Hex code, e.g., #FF0000" },
+                            "visualStyle": { "type": "STRING" }
+                        },
+                        required: ["bpm", "flashColor", "visualStyle"]
+                    }
+                }
+            };
+            
+            try {
+                const response = await fetchWithRetry(API_URL, {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify(payload)
+                });
+                
+                const result = await response.json();
+                const jsonText = result?.candidates?.[0]?.content?.parts?.[0]?.text;
+                
+                if (jsonText) {
+                    const analysis = JSON.parse(jsonText);
+                    
+                    if (analysis.bpm && analysis.flashColor) {
+                        currentSongList[index].bpm = analysis.bpm;
+                        currentSongList[index].flashColor = analysis.flashColor;
+                        currentSongList[index].visualStyle = analysis.visualStyle;
+                        await updateFirestoreSongList(); // Save updated data
+                        showMessage("Analysis Complete", `BPM: ${analysis.bpm}. Color: ${analysis.flashColor}.`);
+                    } else {
+                        throw new Error("AI returned invalid structure or missing data.");
+                    }
+                } else {
+                    throw new Error("AI analysis failed to return a valid response.");
+                }
+            } catch (error) {
+                console.error("AI Analysis Error:", error);
+                showMessage("AI Analysis Failed", `Could not analyze song: ${error.message}. Try again or enter BPM manually.`);
+            } finally {
+                $analyzeBtn.disabled = false;
+                $analyzeBtn.innerHTML = '✨ AI Analyze';
+                renderSongListItems();
+            }
+        }
+        
+        // --- Conductor (Performer Sync) Logic ---
+
+        function startSongSync() {
+            if (beatInterval !== null) return;
+
+            const song = currentSongList[selectedSongIndex];
+            if (!song || !song.bpm || song.bpm < 60 || song.bpm > 240) {
+                 showMessage("Invalid BPM", "Please select a song with a valid BPM (60-240) before starting.");
+                 return;
+            }
+
+            const bpm = song.bpm;
+            const color = song.flashColor;
+            const intervalMs = (60 / bpm) * 1000;
+
+            document.getElementById('startSyncBtn').classList.add('hidden');
+            document.getElementById('stopSyncBtn').classList.remove('hidden');
+            document.getElementById('syncStatus').textContent = `Status: SYNCING ${bpm} BPM`;
+
+            // Initial beat push immediately
+            pushBeat(color);
+
+            // Start the interval for subsequent beats
+            beatInterval = setInterval(() => {
+                pushBeat(color);
+            }, intervalMs);
+        }
+
+        async function pushBeat(colorHex) {
+            if (!db || !showId) return;
+
+            const beatData = {
+                color: colorHex,
+                timestamp: Date.now(), // Milliseconds since epoch
+                showId: showId
+            };
+            
+            try {
+                await setDoc(doc(db, getSyncDocPath(showId)), beatData);
+            } catch (error) {
+                console.error("Error pushing beat:", error);
+                stopConductor();
+                showMessage("Sync Error", `Failed to push beat to Firestore. Stopping sync.`);
+            }
+        }
+
+        function stopConductor() {
+            if (beatInterval !== null) {
+                clearInterval(beatInterval);
+                beatInterval = null;
+            }
+            const $startBtn = document.getElementById('startSyncBtn');
+            const $stopBtn = document.getElementById('stopSyncBtn');
+            const $status = document.getElementById('syncStatus');
+
+            if ($startBtn && $stopBtn && $status) {
+                $startBtn.classList.remove('hidden');
+                $stopBtn.classList.add('hidden');
+                $status.textContent = 'Status: Stopped';
+            }
+        }
+
+        // --- VIEW 3: AUDIENCE JOIN & SYNC LOGIC ---
+
+        function renderAudienceJoin() {
+             clearContent();
+             // Hide main content container
+             $app.classList.add('hidden');
+             // Show audience view full screen
+             $audienceView.classList.remove('hidden');
+             $audienceMessageCard.classList.remove('hidden');
+             
+             document.getElementById('audienceMessageCard').innerHTML = `
+                <h2 class="text-4xl font-extrabold text-white">JOINING SHOW ${showId}</h2>
+                <p class="text-xl mt-2 text-gray-300">Establishing real-time connection...</p>
+                <div class="loading-ring mx-auto mt-4"></div>
+                <p class="text-sm mt-4 text-gray-500">Tap to exit sync mode.</p>
+             `;
+             
+             $audienceView.addEventListener('click', stopAudienceListener);
+             startAudienceListener();
+        }
+        
+        let unsubscribeAudience = null;
+
+        function startAudienceListener() {
+            if (!db || !showId || unsubscribeAudience !== null) return;
+
+            const syncDocRef = doc(db, getSyncDocPath(showId));
+            
+            unsubscribeAudience = onSnapshot(syncDocRef, (docSnapshot) => {
+                const $card = document.getElementById('audienceMessageCard');
+                if (docSnapshot.exists()) {
+                    const data = docSnapshot.data();
+                    handleBeat(data);
+                    
+                    if ($card && !$card.classList.contains('hidden')) {
+                         $card.classList.add('hidden'); // Hide instructions once sync starts
+                    }
+                } else {
+                    // Show not started or conductor stopped
+                    if ($card) $card.classList.remove('hidden');
+                }
+            }, (error) => {
+                console.error("Error in audience listener:", error);
+                unsubscribeAudience = null;
+                showMessage("Sync Error", "Lost connection to the light show stream.");
+                stopAudienceListener(); 
+            });
+        }
+
+        function stopAudienceListener() {
+            if (unsubscribeAudience) {
+                unsubscribeAudience();
+                unsubscribeAudience = null;
+            }
+            $body.style.backgroundColor = '#0f172a'; // Reset background
+            $audienceView.removeEventListener('click', stopAudienceListener);
+            renderSetup(); // Go back to setup/default screen
+        }
+        
+        function handleBeat(beatData) {
+            const flashColor = beatData.color || '#FFFFFF'; // Default to white if color is missing
+            const defaultColor = '#0f172a';
+            
+            // 1. Flash the screen to the beat color (very briefly)
+            $body.style.backgroundColor = flashColor;
+            
+            // 2. Immediately start the reset timer for the flash duration
+            setTimeout(() => {
+                $body.style.backgroundColor = defaultColor;
+            }, 100); // Flash duration of 100ms
+        }
+
+        // --- Initial Load ---
+        window.onload = initFirebase;
+
+    </script>
+</body>
+</html>
